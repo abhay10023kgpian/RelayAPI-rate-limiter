@@ -16,7 +16,8 @@
     "batch_window": {
       "start_utc": "02:00",
       "end_utc": "04:00",
-      "rpm": 1500
+      "rpm": 1500,
+      "grace_minutes": 5
     }
   },
   "harness-sc1": { "name": "Harness Sc1 Under-quota",    "tier": "starter",    "rpm": 100 },
@@ -31,19 +32,19 @@
     "name": "Harness NW batch-under",
     "tier": "enterprise",
     "rpm": 300,
-    "batch_window": { "start_utc": "00:00", "end_utc": "23:59", "rpm": 1500 }
+    "batch_window": { "start_utc": "00:00", "end_utc": "23:59", "rpm": 1500, "grace_minutes": 5 }
   },
   "harness-nw4": {
     "name": "Harness NW batch-over",
     "tier": "enterprise",
     "rpm": 300,
-    "batch_window": { "start_utc": "00:00", "end_utc": "23:59", "rpm": 1500 }
+    "batch_window": { "start_utc": "00:00", "end_utc": "23:59", "rpm": 1500, "grace_minutes": 5 }
   },
   "harness-nw5": {
     "name": "Harness NW batch-isolation",
     "tier": "enterprise",
     "rpm": 300,
-    "batch_window": { "start_utc": "00:00", "end_utc": "23:59", "rpm": 1500 }
+    "batch_window": { "start_utc": "00:00", "end_utc": "23:59", "rpm": 1500, "grace_minutes": 5 }
   },
   "harness-iso-other": {
     "name": "Harness NW isolation-other",

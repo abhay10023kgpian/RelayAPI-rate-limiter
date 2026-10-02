@@ -48,7 +48,22 @@ Error direction: if Redis is unavailable, the middleware fails closed (reject th
 
 **Customer identity:** X-Customer-Id header, trusted from the API gateway as documented.
 
-**Batch window override:** Stored in customers.json as a structured field — batch_window: { start_utc: "02:00", end_utc: "04:00", rpm: 1500 }. No customer-specific branches in middleware logic.
+**Batch window override:** Stored in customers.json as a structured field — batch_window: { start_utc: "02:00", end_utc: "04:00", rpm: 1500, grace_minutes: 5 }. No customer-specific branches in middleware logic.
+
+**Grace period — preventing the 429 cliff at window boundaries:**
+
+A naive implementation would switch from 1500 RPM to 300 RPM at exactly 04:00. But the sliding window still holds ~1000 entries from the last 60 seconds of batch traffic. With a 300 limit and 1000 entries, every request gets 429'd for up to 60 seconds — the exact sudden rejection storm Marcus escalated about.
+
+The solution has two parts:
+
+1. **Separate Redis keys per regime.** Batch/grace traffic counts against `rl:<id>:batch`; normal traffic counts against `rl:<id>`. When the grace period ends, the middleware switches to the normal key which has zero entries — no cliff. The batch key expires naturally via Redis TTL.
+
+2. **Linear ramp-down during grace period.** For 5 minutes after the batch window ends (04:00–04:05), the effective limit linearly interpolates from 1500 → 300. This gives Northwind's ERP time to wind down naturally rather than hitting a wall. The grace period shares the batch key so the sliding window memory is continuous — the ramp accounts for recent batch traffic correctly.
+
+The three regimes:
+- **02:00–04:00 (batch):** limit = 1500, key = `rl:northwind:batch`
+- **04:00–04:05 (grace):** limit ramps 1500 → 300 linearly, key = `rl:northwind:batch`
+- **04:05+ (normal):** limit = 300, key = `rl:northwind` (fresh, 0 entries)
 
 **On the choice of specific numeric parameters:**
 
