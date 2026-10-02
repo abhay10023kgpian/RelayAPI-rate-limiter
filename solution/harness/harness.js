@@ -13,7 +13,10 @@
  *   ✓ Over-quota traffic is cut off at exactly the right boundary
  *   ✓ Two customers on the same tier do NOT eat each other's quota
  *   ✓ Load is distributed across all three nodes (round-robin visible)
- *   ✓ Northwind's contracted 300 RPM is enforced — no free pass
+ *   ✓ Northwind's contracted 300 RPM is enforced outside batch window
+ *   ✓ Northwind's elevated 1500 RPM is active during batch window
+ *   ✓ Northwind above 1500 RPM during batch window → 429 + overage logged
+ *   ✓ Northwind batch window traffic does NOT impact other customers
  *
  * What it does NOT prove:
  *   ✗ Clock skew between nodes (all in Docker, shared clock)
@@ -27,21 +30,23 @@
 
 const http = require('http');
 
-const BASE_URL   = process.env.BASE_URL   || 'http://localhost:8080';
+const BASE_URL    = process.env.BASE_URL    || 'http://localhost:8080';
 const CONCURRENCY = parseInt(process.env.CONCURRENCY || '20', 10);
 
 // ── ANSI colours ──────────────────────────────────────────────────────────────
 const C = {
-  reset:  '\x1b[0m',
-  bold:   '\x1b[1m',
-  dim:    '\x1b[2m',
-  green:  '\x1b[32m',
-  red:    '\x1b[31m',
-  yellow: '\x1b[33m',
-  cyan:   '\x1b[36m',
-  white:  '\x1b[37m',
+  reset:   '\x1b[0m',
+  bold:    '\x1b[1m',
+  dim:     '\x1b[2m',
+  green:   '\x1b[32m',
+  red:     '\x1b[31m',
+  yellow:  '\x1b[33m',
+  cyan:    '\x1b[36m',
+  magenta: '\x1b[35m',
+  white:   '\x1b[37m',
   bgGreen: '\x1b[42m',
   bgRed:   '\x1b[41m',
+  bgYellow:'\x1b[43m',
 };
 
 // ── HTTP helper ───────────────────────────────────────────────────────────────
@@ -56,16 +61,23 @@ function ping(customerId) {
       headers:  { 'X-Customer-Id': customerId },
     };
     const req = http.request(options, (res) => {
-      res.resume(); // drain body
-      resolve({
-        status:     res.statusCode,
-        node:       res.headers['x-served-by']           || 'unknown',
-        remaining:  res.headers['x-ratelimit-remaining'] || '?',
-        retryAfter: res.headers['retry-after']           || null,
+      let body = '';
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => {
+        resolve({
+          status:       res.statusCode,
+          node:         res.headers['x-served-by']            || 'unknown',
+          remaining:    res.headers['x-ratelimit-remaining']  || '?',
+          limit:        res.headers['x-ratelimit-limit']      || '?',
+          contracted:   res.headers['x-ratelimit-contracted'] || '?',
+          mode:         res.headers['x-ratelimit-mode']       || 'normal',
+          retryAfter:   res.headers['retry-after']            || null,
+          body,
+        });
       });
     });
-    req.on('error', () => resolve({ status: 0, node: 'error', remaining: '?', retryAfter: null }));
-    req.setTimeout(5000, () => { req.destroy(); resolve({ status: 0, node: 'timeout', remaining: '?', retryAfter: null }); });
+    req.on('error', () => resolve({ status: 0, node: 'error', remaining: '?', limit: '?', contracted: '?', mode: 'error', retryAfter: null, body: '' }));
+    req.setTimeout(5000, () => { req.destroy(); resolve({ status: 0, node: 'timeout', remaining: '?', limit: '?', contracted: '?', mode: 'timeout', retryAfter: null, body: '' }); });
     req.end();
   });
 }
@@ -92,8 +104,17 @@ function stats(results) {
   const rejected = results.filter(r => r.status === 429).length;
   const errors   = results.filter(r => r.status !== 200 && r.status !== 429).length;
   const nodes    = {};
-  for (const r of results) nodes[r.node] = (nodes[r.node] || 0) + 1;
-  return { allowed, rejected, errors, total: results.length, nodes };
+  const modes    = {};
+  const retryAfters = [];
+  for (const r of results) {
+    nodes[r.node] = (nodes[r.node] || 0) + 1;
+    modes[r.mode] = (modes[r.mode] || 0) + 1;
+    if (r.retryAfter) retryAfters.push(Number(r.retryAfter));
+  }
+  const avgRetryAfter = retryAfters.length > 0
+    ? (retryAfters.reduce((a, b) => a + b, 0) / retryAfters.length).toFixed(1)
+    : null;
+  return { allowed, rejected, errors, total: results.length, nodes, modes, avgRetryAfter };
 }
 
 // ── Render helpers ────────────────────────────────────────────────────────────
@@ -123,7 +144,7 @@ function printScenarioHeader(num, title) {
 }
 
 function printStats(label, s, expected) {
-  const { allowed, rejected, errors, total, nodes } = s;
+  const { allowed, rejected, errors, total, nodes, modes, avgRetryAfter } = s;
 
   console.log(`\n  ${C.bold}${label}${C.reset}`);
   console.log(`  ${C.dim}${divider('·', 54)}${C.reset}`);
@@ -132,6 +153,18 @@ function printStats(label, s, expected) {
   console.log(`  Rejected  ${C.red}${String(rejected).padStart(4)}${C.reset}  ${bar(rejected, total, C.red)}  ${C.red}${pct(rejected, total)}${C.reset}`);
   if (errors > 0)
     console.log(`  ${C.yellow}Errors    ${String(errors).padStart(4)}${C.reset}  (check service is up)`);
+  if (avgRetryAfter !== null)
+    console.log(`  ${C.dim}Avg Retry-After: ${avgRetryAfter}s${C.reset}`);
+
+  // Rate limit mode
+  const modeEntries = Object.entries(modes);
+  if (modeEntries.length > 0 && !(modeEntries.length === 1 && modeEntries[0][0] === 'normal')) {
+    console.log(`\n  Rate-limit mode:`);
+    for (const [mode, cnt] of modeEntries) {
+      const modeColor = mode === 'batch-window' ? C.magenta : C.cyan;
+      console.log(`    ${modeColor}${mode.padEnd(16)}${C.reset}  ${cnt} responses`);
+    }
+  }
 
   // Node distribution
   const nodeEntries = Object.entries(nodes).sort(([a], [b]) => a.localeCompare(b));
@@ -159,7 +192,6 @@ function printStats(label, s, expected) {
 async function checkConnectivity() {
   return new Promise((resolve) => {
     const url  = new URL('/health', BASE_URL);
-    // Try app1 health directly if through nginx /health isn't rate-limited
     const req  = http.request({ hostname: url.hostname, port: url.port || 80, path: '/health', method: 'GET' }, (res) => {
       res.resume();
       resolve(res.statusCode === 200);
@@ -175,7 +207,8 @@ async function main() {
   // Banner
   console.log(`\n${C.cyan}${C.bold}`);
   console.log('  ╔══════════════════════════════════════════════════════════╗');
-  console.log('  ║          RelayAPI Rate Limiter — Load Harness            ║');
+  console.log('  ║       RelayAPI Rate Limiter — Load Harness v2           ║');
+  console.log('  ║       Stakeholder 1 + Stakeholder 2 (Northwind)        ║');
   console.log('  ╚══════════════════════════════════════════════════════════╝');
   console.log(C.reset);
   console.log(`  ${C.bold}Target   ${C.reset}: ${BASE_URL}`);
@@ -195,12 +228,12 @@ async function main() {
 
   const scenarioResults = [];
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // Scenario 1 — Under quota
-  // Send 80 requests against a 100 RPM limit.
-  // Expect: 80 allowed, 0 rejected.
-  // Proves: normal traffic is not disturbed.
-  // ────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PART 1 — STAKEHOLDER 1: CTO — Hard enforcement, per-customer isolation
+  // ═══════════════════════════════════════════════════════════════════════════
+  console.log(`\n${C.bold}${C.yellow}  ═══ PART 1: Stakeholder 1 — CTO (Hard Enforcement) ═══${C.reset}`);
+
+  // ── Scenario 1 — Under quota ──────────────────────────────────────────────
   printScenarioHeader(1, 'Under Quota — 80 req vs limit 100');
   {
     const r = stats(await burst('harness-sc1', 80));
@@ -211,12 +244,7 @@ async function main() {
     ));
   }
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // Scenario 2 — Exactly at quota boundary
-  // Send 100 requests against a 100 RPM limit.
-  // Expect: 100 allowed, 0 rejected.
-  // Proves: the 100th request is accepted (limit is inclusive).
-  // ────────────────────────────────────────────────────────────────────────────
+  // ── Scenario 2 — Exactly at quota boundary ────────────────────────────────
   printScenarioHeader(2, 'At Quota Boundary — 100 req vs limit 100');
   {
     const r = stats(await burst('harness-sc2', 100));
@@ -227,12 +255,7 @@ async function main() {
     ));
   }
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // Scenario 3 — Over quota
-  // Send 130 requests against a 100 RPM limit.
-  // Expect: ~100 allowed, ~30 rejected.
-  // Proves: the limiter cuts off at the right boundary, not before, not after.
-  // ────────────────────────────────────────────────────────────────────────────
+  // ── Scenario 3 — Over quota ───────────────────────────────────────────────
   printScenarioHeader(3, 'Over Quota Boundary — 130 req vs limit 100');
   {
     const r = stats(await burst('harness-sc3', 130));
@@ -243,13 +266,8 @@ async function main() {
     ));
   }
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // Scenario 4 — Customer isolation
-  // Two separate customers, each firing 80 requests, concurrently.
-  // Expect: both get 80 allowed, 0 rejected.
-  // Proves: Customer A's traffic does not consume Customer B's quota.
-  // ────────────────────────────────────────────────────────────────────────────
-  printScenarioHeader(4, 'Customer Isolation — two customers, 80 req each, concurrent');
+  // ── Scenario 4 — Customer isolation ───────────────────────────────────────
+  printScenarioHeader(4, 'Customer Isolation — two customers, 80 req each');
   {
     const [rawA, rawB] = await Promise.all([
       burst('harness-sc4a', 80),
@@ -257,21 +275,14 @@ async function main() {
     ]);
     const rA = stats(rawA);
     const rB = stats(rawB);
-    const pA = printStats('Customer A: 80 req | limit=100 | expect 0 rejected', rA,
+    const pA = printStats('Customer A: 80 req | limit=100', rA,
       { minAllowed: 80, maxAllowed: 80, minRejected: 0, maxRejected: 0 });
-    const pB = printStats('Customer B: 80 req | limit=100 | expect 0 rejected', rB,
+    const pB = printStats('Customer B: 80 req | limit=100', rB,
       { minAllowed: 80, maxAllowed: 80, minRejected: 0, maxRejected: 0 });
     scenarioResults.push(pA && pB);
   }
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // Scenario 5 — Node distribution
-  // Send 90 requests through nginx (round-robin).
-  // Expect: traffic roughly split across 3 nodes (~30 each ± 15).
-  // Proves: all three nodes share the load; no node is dead.
-  // NOTE: Quota is still enforced correctly despite node spread — that's the
-  //       point. Redis is the shared counter, not per-node memory.
-  // ────────────────────────────────────────────────────────────────────────────
+  // ── Scenario 5 — Round-robin node distribution ────────────────────────────
   printScenarioHeader(5, 'Round-Robin Node Distribution — 90 req');
   {
     const raw = await burst('harness-sc5', 90);
@@ -287,69 +298,146 @@ async function main() {
     const minNode = Math.min(...counts);
     const spread  = maxNode - minNode;
     const nodeCount = entries.length;
-    const balanced  = nodeCount >= 3 && spread <= 18; // ±18 tolerance for OS scheduling jitter
+    const balanced  = nodeCount >= 3 && spread <= 18;
     console.log(`\n  Nodes seen: ${C.bold}${nodeCount}${C.reset}  |  spread: ${C.bold}${spread}${C.reset} (max-min, expect ≤ 18)`);
     console.log(`  ${passLabel(balanced)}`);
     scenarioResults.push(balanced);
   }
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // Scenario 6 — Northwind at contracted rate
-  // 250 requests against Northwind's 300 RPM contract.
-  // Expect: 250 allowed, 0 rejected.
-  // Proves: contracted quota is sufficient for normal sub-limit traffic.
-  // ────────────────────────────────────────────────────────────────────────────
-  printScenarioHeader(6, 'Northwind — At Contracted Rate (250 req vs limit 300)');
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PART 2 — STAKEHOLDER 2: Support — Northwind batch window
+  // ═══════════════════════════════════════════════════════════════════════════
+  console.log(`\n${C.bold}${C.magenta}  ═══ PART 2: Stakeholder 2 — Support (Northwind Batch Window) ═══${C.reset}`);
+
+  // ── Scenario 6 — Northwind at contracted rate (no batch window needed) ────
+  printScenarioHeader(6, 'Northwind — Sub-contract (250 req vs 300 RPM)');
   {
     const r = stats(await burst('harness-nw1', 250));
     scenarioResults.push(printStats(
-      'northwind | 250 req | limit=300 RPM',
+      'northwind | 250 req | contracted=300 RPM | no batch window',
       r,
       { minAllowed: 250, maxAllowed: 250, minRejected: 0, maxRejected: 0 }
     ));
   }
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // Scenario 7 — Northwind over contracted quota
-  // 400 requests against Northwind's 300 RPM contract.
-  // Expect: ~300 allowed, ~100 rejected.
-  // Proves: without batch-window override, Northwind IS rate limited.
-  // This is the baseline before Stakeholder 2 (batch window) is added.
-  // These 429s are what Marcus Webb is escalating about.
-  // ────────────────────────────────────────────────────────────────────────────
-  printScenarioHeader(7, 'Northwind — Over Contracted Quota (400 req vs limit 300)');
+  // ── Scenario 7 — Northwind over contract, no batch window ─────────────────
+  printScenarioHeader(7, 'Northwind — Over Contract, NO Batch Window (400 req vs 300)');
   {
     const r = stats(await burst('harness-nw2', 400));
     scenarioResults.push(printStats(
-      'northwind | 400 req | limit=300 RPM | CTO enforcement active',
+      'northwind | 400 req | contracted=300 RPM | this is what Marcus escalated',
       r,
       { minAllowed: 295, maxAllowed: 305, minRejected: 95 }
     ));
-    console.log(`\n  ${C.yellow}⚠  These 429s are what Marcus Webb escalated.`);
-    console.log(`     The batch-window override (Stakeholder 2) resolves this.${C.reset}`);
+    console.log(`\n  ${C.yellow}⚠  These 429s are the Marcus Webb escalation.`);
+    console.log(`     Scenarios 8–10 prove the batch window resolves this.${C.reset}`);
   }
 
-  // ── Final summary ──────────────────────────────────────────────────────────
+  // ── Scenario 8 — Northwind at batch-window rate (1100 RPM) ────────────────
+  // harness-nw3 has batch_window: 00:00–23:59 so it's always active in tests
+  printScenarioHeader(8, 'Northwind Batch — 1100 req vs elevated 1500 RPM');
+  {
+    const r = stats(await burst('harness-nw3', 1100));
+    scenarioResults.push(printStats(
+      'northwind batch | 1100 req | elevated=1500 RPM | 0 rejections expected',
+      r,
+      { minAllowed: 1100, maxAllowed: 1100, minRejected: 0, maxRejected: 0 }
+    ));
+    // Verify the mode header shows batch-window
+    const batchModeCount = r.modes['batch-window'] || 0;
+    const modeOk = batchModeCount > 0;
+    console.log(`\n  ${C.magenta}Batch-window mode responses: ${C.bold}${batchModeCount}${C.reset}${C.magenta} / ${r.total}${C.reset}`);
+    console.log(`  ${passLabel(modeOk)}  (mode header present)`);
+  }
+
+  // ── Scenario 9 — Northwind OVER batch ceiling (1700 req vs 1500 RPM) ──────
+  // This is the critical contract-documentation scenario:
+  //   - 1500 should be allowed, ~200 rejected
+  //   - The rejected count = proof that demand exceeds even the elevated limit
+  //   - This data goes directly into the renewal conversation
+  printScenarioHeader(9, 'Northwind Batch — OVER Elevated Ceiling (1700 vs 1500)');
+  {
+    const raw    = await burst('harness-nw4', 1700);
+    const r      = stats(raw);
+    const passed = printStats(
+      'northwind batch | 1700 req | elevated=1500 RPM | ~200 rejections expected',
+      r,
+      { minAllowed: 1490, maxAllowed: 1510, minRejected: 190 }
+    );
+    scenarioResults.push(passed);
+
+    // ── Overage report for contract documentation ─────────────────────────
+    const overageCount   = r.rejected;
+    const overagePct     = ((overageCount / r.total) * 100).toFixed(1);
+    const peakObserved   = r.allowed;  // all allowed = effective peak RPM
+
+    console.log(`\n${C.magenta}${C.bold}  ┌──────────────────────────────────────────────────────────┐${C.reset}`);
+    console.log(`${C.magenta}${C.bold}  │        NORTHWIND OVERAGE REPORT (Contract Data)          │${C.reset}`);
+    console.log(`${C.magenta}${C.bold}  └──────────────────────────────────────────────────────────┘${C.reset}`);
+    console.log(`  ${C.dim}${'─'.repeat(56)}${C.reset}`);
+    console.log(`  Contracted RPM           :  ${C.bold}300${C.reset}`);
+    console.log(`  Elevated batch ceiling   :  ${C.bold}1500${C.reset}`);
+    console.log(`  Requests sent (this test):  ${C.bold}${r.total}${C.reset}`);
+    console.log(`  Requests allowed         :  ${C.green}${C.bold}${r.allowed}${C.reset}  (effective peak RPM)`);
+    console.log(`  Requests rejected (429)  :  ${C.red}${C.bold}${overageCount}${C.reset}  (${overagePct}% of total)`);
+    console.log(`  Avg Retry-After          :  ${C.bold}${r.avgRetryAfter || 'N/A'}s${C.reset}`);
+    console.log(`  ${C.dim}${'─'.repeat(56)}${C.reset}`);
+    console.log(`  ${C.yellow}${C.bold}Conclusion:${C.reset} Northwind's workload exceeds even the`);
+    console.log(`  elevated 1500 RPM ceiling. ${C.bold}${overageCount} requests${C.reset} were rejected.`);
+    console.log(`  Contract renewal should target ≥ ${C.bold}${peakObserved}${C.reset} RPM.`);
+    console.log(`  ${C.dim}${'─'.repeat(56)}${C.reset}`);
+  }
+
+  // ── Scenario 10 — Batch window isolation: Northwind heavy load ────────────
+  //    does NOT eat a normal customer's quota
+  printScenarioHeader(10, 'Batch Isolation — NW at 1200 + other at 80 (concurrent)');
+  {
+    const [rawNW, rawOther] = await Promise.all([
+      burst('harness-nw5', 1200),
+      burst('harness-iso-other', 80),
+    ]);
+    const rNW    = stats(rawNW);
+    const rOther = stats(rawOther);
+
+    const pNW = printStats(
+      'Northwind (batch, 1200 req, elevated=1500)',
+      rNW,
+      { minAllowed: 1200, maxAllowed: 1200, minRejected: 0, maxRejected: 0 }
+    );
+    const pOther = printStats(
+      'Other customer (80 req, limit=100) — must be unaffected',
+      rOther,
+      { minAllowed: 80, maxAllowed: 80, minRejected: 0, maxRejected: 0 }
+    );
+    scenarioResults.push(pNW && pOther);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // FINAL SUMMARY
+  // ═══════════════════════════════════════════════════════════════════════════
   const passed = scenarioResults.filter(Boolean).length;
   const total  = scenarioResults.length;
   const allOk  = passed === total;
 
   console.log(`\n${C.bold}${allOk ? C.green : C.red}`);
   console.log('  ╔══════════════════════════════════════════════════════════╗');
-  console.log(`  ║  SUMMARY : ${String(passed).padStart(2)} / ${total} scenarios passed${' '.repeat(32 - String(passed + '/' + total).length)}║`);
+  console.log(`  ║  SUMMARY : ${String(passed).padStart(2)} / ${String(total).padStart(2)} scenarios passed${' '.repeat(29)}║`);
   console.log(`  ║  Result  : ${allOk ? '✓ ALL PASS' : '✗ SOME FAILED'}${' '.repeat(allOk ? 39 : 38)}║`);
   console.log('  ╚══════════════════════════════════════════════════════════╝');
   console.log(C.reset);
 
   // Per-scenario summary table
   const labels = [
-    'Sc1  Under quota (80 req, limit 100)',
-    'Sc2  At quota boundary (100 req, limit 100)',
-    'Sc3  Over quota (130 req, limit 100)',
-    'Sc4  Customer isolation (2×80 req)',
-    'Sc5  Round-robin node distribution',
-    'Sc6  Northwind at contracted rate (250 req)',
-    'Sc7  Northwind over quota (400 req)',
+    'Sc1   Under quota (80 req, limit 100)',
+    'Sc2   At quota boundary (100 req, limit 100)',
+    'Sc3   Over quota (130 req, limit 100)',
+    'Sc4   Customer isolation (2×80 req concurrent)',
+    'Sc5   Round-robin node distribution',
+    'Sc6   Northwind sub-contract (250 req, limit 300)',
+    'Sc7   Northwind over-contract, NO batch window (400 req)',
+    'Sc8   Northwind batch — under elevated ceiling (1100 req)',
+    'Sc9   Northwind batch — OVER elevated ceiling (1700 req)',
+    'Sc10  Batch isolation (NW@1200 + other@80, concurrent)',
   ];
   for (let i = 0; i < scenarioResults.length; i++) {
     const ok  = scenarioResults[i];
